@@ -924,9 +924,14 @@ static int __udp_remote_on_read(as_udp_t *remote, __const__ struct msghdr *msg, 
     if(can_send == 1)
     {
         LOG_DEBUG("send response\n");
-        LOG_INFO("matched dns response: %s\n", address_str((struct sockaddr *) as_dest_addr((as_socket_t *) remote)));
         if(rcode == 0)
-            LOG_INFO("parsed dns addr = %s\n", address_str((struct sockaddr *) &addr));
+        {
+            LOG_INFO("query dns success, matched dns server: %s, ip = %s\n", address_str((struct sockaddr *) as_dest_addr((as_socket_t *) remote)), address_without_port_str((struct sockaddr *) &addr));
+        }
+        else
+        {
+            LOG_INFO("query dns failed, matched dns server: %s\n", address_str((struct sockaddr *) as_dest_addr((as_socket_t *) remote)));
+        }
         client_data->first = (as_socket_t *) remote;
         if(client_data->status != 0)
             as_udp_write(client, buf, len);

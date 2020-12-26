@@ -13,4 +13,6 @@ int getipv6hostbyname(__const__ char *hostname, struct sockaddr_in6 *addr);
 
 char *address_str(struct sockaddr *addr);
 
+char *address_without_port_str(struct sockaddr *addr);
+
 #endif

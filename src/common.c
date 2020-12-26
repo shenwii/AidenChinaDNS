@@ -86,3 +86,13 @@ char *address_str(struct sockaddr* addr)
     }
     return addstr;
 }
+
+char *address_without_port_str(struct sockaddr *addr)
+{
+    static char addstr[80];
+    if(addr->sa_family == AF_INET)
+        inet_ntop(addr->sa_family, &((struct sockaddr_in *) addr)->sin_addr, addstr, 80);
+    else
+        inet_ntop(addr->sa_family, &((struct sockaddr_in6 *) addr)->sin6_addr, addstr, 80);
+    return addstr;
+}
