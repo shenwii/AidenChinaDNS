@@ -2,10 +2,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
-#include <pthread.h>
 #include <netinet/in.h>
 
 #include "ascore.h"
+#include "dnsprot.h"
 #include "common.h"
 #include "iconf.h"
 #include "log.h"
@@ -13,44 +13,59 @@
 
 struct sockaddr **china_dns_list;
 struct sockaddr **trustable_dns_list;
+size_t all_dns_cnt;
 cidr_t *cidr;
 conf_t conf;
-
-struct __client_data_s
-{
-    as_socket_t *first;
-    as_socket_t **remotes;
-    pthread_mutex_t lock;
-    char type;
-    char status;
-};
-
-struct __remote_data_s
-{
-    as_socket_t *client;
-    struct __client_data_s *client_data;
-    struct sockaddr *dns_addr;
-    pthread_mutex_t lock;
-    pthread_cond_t signal;
-    char *buf;
-    int len;
-    char status;
-    char type;
-};
 
 typedef struct __client_data_s __client_data_t;
 
 typedef struct __remote_data_s __remote_data_t;
 
-static struct sockaddr** __parse_address_list(char *address_list_str);
+typedef struct
+{
+    as_socket_t *sck;
+    /**
+     * 0: inited
+     * 1: connected
+     * 2: closed
+     **/
+    char status;
+    char on_send;
+} __sck_sts_t;
+
+
+struct __client_data_s
+{
+    __sck_sts_t sck_sts;
+    __remote_data_t *remote_datas;
+    as_socket_t *first;
+    int remote_alive_count;
+    unsigned char **buf_arr;
+    size_t *buf_len_arr;
+    size_t arr_len;
+};
+
+struct __remote_data_s
+{
+    __sck_sts_t sck_sts;
+    __client_data_t *client_data;
+    /**
+     * 1: china dns
+     * 2: trustable dns
+     **/
+    int type;
+    size_t read_pos;
+};
+
+static struct sockaddr** __parse_address_list(char *address_list_str, size_t *cnt);
 
 static struct sockaddr* __parse_address(char *address_str);
-
-static int __parse_dns_protocol(char *buf, int len, struct sockaddr *addr, char sck_type);
 
 static int __parse_list_files(char *files_str);
 
 static int __parse_list_file(char *file_str);
+
+static int __free_client_data(__client_data_t *client_data);
 
 static int __client_destroy(as_socket_t *sck);
 
@@ -58,19 +73,25 @@ static int __remote_udp_destroy(as_socket_t *sck);
 
 static int __remote_tcp_destroy(as_socket_t *sck);
 
-static int __tcp_client_on_connect(as_tcp_t *srv, as_tcp_t *clnt, void **data, as_socket_destroying_f *cb);
+static int __tcp_client_on_accepted(as_tcp_t *srv, as_tcp_t *clnt, void **data, as_socket_destroying_f *cb);
 
-static void *__tcp_connect_to_remote_thread(void *param);
+static int __tcp_remote_on_connected(as_tcp_t *remote, char status);
 
-static int __tcp_remote_on_read(as_tcp_t *remote, __const__ char *buf, __const__ int len);
+static int __tcp_remote_writing(as_tcp_t *remote);
 
-static int __tcp_client_on_read(as_tcp_t *clnt, __const__ char *buf, __const__ int len);
+static int __tcp_remote_on_wrote(as_tcp_t *remote, __const__ unsigned char *buf, __const__ size_t len);
+
+static int __tcp_remote_on_read(as_tcp_t *remote, __const__ struct msghdr *msg, __const__ unsigned char *buf, __const__ size_t len);
+
+static int __tcp_client_on_read(as_tcp_t *clnt, __const__ struct msghdr *msg, __const__ unsigned char *buf, __const__ size_t len);
 
 static int __udp_client_on_connect(as_udp_t *srv, as_udp_t *clnt, void **data, as_socket_destroying_f *cb);
 
-static int __udp_client_on_read(as_udp_t *clnt, __const__ struct msghdr *msg, __const__ char *buf, __const__ int len);
+static int __udp_client_on_read(as_udp_t *clnt, __const__ struct msghdr *msg, __const__ unsigned char *buf, __const__ size_t len);
 
-static int __udp_remote_on_read(as_udp_t *remote, __const__ struct msghdr *msg, __const__ char *buf, __const__ int len);
+static int __udp_remote_on_wrote(as_udp_t *remote, __const__ unsigned char *buf, __const__ size_t len);
+
+static int __udp_remote_on_read(as_udp_t *remote, __const__ struct msghdr *msg, __const__ unsigned char *buf, __const__ size_t len);
 
 static int __usage(char *prog)
 {
@@ -103,8 +124,9 @@ int main(int argc, char **argv)
         LOG_ERR(MSG_PARAM_IP_LIST);
         return 1;
     }
-    china_dns_list = __parse_address_list(conf.cdns);
-    trustable_dns_list = __parse_address_list(conf.tdns);
+    all_dns_cnt = 0;
+    china_dns_list = __parse_address_list(conf.cdns, &all_dns_cnt);
+    trustable_dns_list = __parse_address_list(conf.tdns, &all_dns_cnt);
     cidr = cidr_init();
     if(__parse_list_files(conf.iplist) != 0)
     {
@@ -135,7 +157,7 @@ int main(int argc, char **argv)
         cidr_free(cidr);
         return 1;
     }
-    if(as_tcp_listen(tcp, __tcp_client_on_connect) != 0)
+    if(as_tcp_listen(tcp, __tcp_client_on_accepted) != 0)
     {
         LOG_ERR(MSG_TCP_LISTENED);
         cidr_free(cidr);
@@ -151,7 +173,7 @@ int main(int argc, char **argv)
         cidr_free(cidr);
         return 1;
     }
-    if(as_tcp_listen(tcp, __tcp_client_on_connect) != 0)
+    if(as_tcp_listen(tcp, __tcp_client_on_accepted) != 0)
     {
         LOG_ERR(MSG_TCP_LISTENED);
         cidr_free(cidr);
@@ -194,7 +216,7 @@ int main(int argc, char **argv)
     return 0;
 }
 
-static struct sockaddr** __parse_address_list(char *address_list_str)
+static struct sockaddr** __parse_address_list(char *address_list_str, size_t *cnt)
 {
     int len = 1;
     struct sockaddr **addr_list = (struct sockaddr **) malloc(sizeof(struct sockaddr *) * len);
@@ -252,6 +274,7 @@ static struct sockaddr** __parse_address_list(char *address_list_str)
             addr_list[len - 1] = NULL;
         }
     }
+    *cnt += len - 1;
     return addr_list;
 }
 
@@ -311,112 +334,6 @@ static struct sockaddr* __parse_address(char *address_str)
         addr6->sin6_port = htons(port);
     }
     return addr;
-}
-
-static int __dns_queries_len(unsigned char *buf, int len)
-{
-    int tl = 0;
-    unsigned char l;
-    if(len == 0)
-        return 0;
-    if(buf[0] >> 6 == 0x03)
-    {
-        if(len <= 2)
-            return -1;
-        else
-            return 2;
-    }
-    else
-    {
-        while((l = *buf) != 0)
-        {
-            if(len <= l + 1)
-                return -1;
-            tl += l + 1;
-            buf += l + 1;
-        }
-    }
-    if(len <= tl + 1)
-        return -1;
-    else
-        return tl + 1;
-}
-
-static int __parse_dns_protocol(char *buf, int len, struct sockaddr *addr, char sck_type)
-{
-    int dl;
-    uint16_t cnt;
-    uint16_t *type;
-    char *data;
-    uint16_t *data_len;
-    //handle header
-    if(sck_type == 1)
-    {
-        if(len <= 2)
-            return 1;
-        buf += 2;
-        len -= 2;
-    }
-    if(len <= 12)
-        return 1;
-    char rcode = buf[3] >> 3 & 0x0F;
-    if(rcode != 0)
-        return 1;
-    uint16_t *quest_cnt = (uint16_t *) &buf[4];
-    uint16_t *answ_cnt = (uint16_t *) &buf[6];
-//     uint16_t *auth_cnt = (uint16_t *) &buf[8];
-//     uint16_t *addit_cnt = (uint16_t *) &buf[10];
-    //skpi header
-    buf += 12;
-    len -= 12;
-    //handle Questions
-    cnt = ntohs(*quest_cnt);
-    while(cnt--)
-    {
-        dl = __dns_queries_len((unsigned char *) buf, len);
-        if(dl == -1)
-            return 2;
-        if(len <= dl + 4)
-            return 3;
-        buf += dl + 4;
-        len -= dl + 4;
-    }
-    //handle Answers
-    cnt = ntohs(*answ_cnt);
-    while(cnt--)
-    {
-        dl = __dns_queries_len((unsigned char *) buf, len);
-        if(dl == -1)
-            return 2;
-        if(len <= dl + 8)
-            return 4;
-        buf += dl;
-        len -= dl;
-        type = (uint16_t *) buf;
-        buf += 8;
-        len -= 8;
-        data_len = (uint16_t *) buf;
-        data = &buf[2];
-        buf += 2 + ntohs(*data_len);
-        len -= 2 + ntohs(*data_len);
-        if(ntohs(*type) == 0x01 && ntohs(*data_len) == 4)
-        {
-            //ipv4
-            addr->sa_family = AF_INET;
-            struct sockaddr_in *addr4 = (struct sockaddr_in *) addr;
-            memcpy(&addr4->sin_addr, data, 4);
-            return 0;
-        }
-        if(ntohs(*type) == 0x1C && ntohs(*data_len) == 16)
-        {
-            //ipv6
-            addr->sa_family = AF_INET6;
-            struct sockaddr_in6 *addr6 = (struct sockaddr_in6 *) addr;
-            memcpy(&addr6->sin6_addr, data, 16);
-            return 0;
-        }
-    }
-    return -1;
 }
 
 static int __parse_list_files(char *files_str)
@@ -496,435 +413,239 @@ static int __parse_list_file(char *file_str)
     return 0;
 }
 
+static int __free_client_data(__client_data_t *client_data)
+{
+    unsigned char **buf_arr;
+    if(client_data->arr_len != 0)
+    {
+        buf_arr = client_data->buf_arr;
+        while(client_data->arr_len--)
+            free(*buf_arr++);
+        free(client_data->buf_len_arr);
+        free(client_data->buf_arr);
+    }
+    free(client_data->remote_datas);
+    return 0;
+}
+
 static int __client_destroy(as_socket_t *sck)
 {
+    size_t cnt = all_dns_cnt;
     __client_data_t *client_data = (__client_data_t *) as_socket_data(sck);
-    as_socket_t **remotes = client_data->remotes;
-    as_socket_t *remote;
-    while((remote = *remotes++) != NULL)
+    client_data->sck_sts.status = 2;
+    if(client_data->remote_alive_count == 0)
     {
-        as_close(remote);
+        return __free_client_data(client_data);
     }
-    client_data->status = 0;
+    else
+    {
+        __remote_data_t *remote_datas = client_data->remote_datas;
+        __remote_data_t *remote_data;
+        while(cnt--)
+        {
+            remote_data = remote_datas++;
+            if(remote_data->sck_sts.status != 2)
+            {
+                as_close(remote_data->sck_sts.sck);
+            }
+        }
+    }
     return 0;
 }
 
 static int __remote_udp_destroy(as_socket_t *sck)
 {
-    char m = 0;
     __remote_data_t *remote_data = (__remote_data_t *) as_socket_data(sck);
     __client_data_t *client_data = remote_data->client_data;
-    as_socket_t **remotes = client_data->remotes;
-    as_socket_t *remote;
-    while((remote = *remotes++) != NULL)
+    if(remote_data->sck_sts.status != 2)
     {
-        if(remote == sck)
-            m = 1;
-        if(m == 1)
-            *(remotes - 1) = *remotes;
+        remote_data->sck_sts.status = 2;
+        client_data->remote_alive_count--;
+        if(client_data->remote_alive_count == 0)
+            return __free_client_data(client_data);
     }
-    if(*client_data->remotes == NULL)
-    {
-        free(client_data->remotes);
-        free(client_data);
-    }
-    free(remote_data);
     return 0;
 }
 
 static int __remote_tcp_destroy(as_socket_t *sck)
 {
-    char m = 0;
     __remote_data_t *remote_data = (__remote_data_t *) as_socket_data(sck);
     __client_data_t *client_data = remote_data->client_data;
-    as_socket_t **remotes = client_data->remotes;
-    as_socket_t *remote;
-    pthread_mutex_lock(&remote_data->lock);
-    remote_data->status = 2;
-    pthread_cond_broadcast(&remote_data->signal);
-    pthread_mutex_unlock(&remote_data->lock);
-    while((remote = *remotes++) != NULL)
+    if(remote_data->sck_sts.status != 2)
     {
-        if(remote == sck)
-            m = 1;
-        if(m == 1)
-            *(remotes - 1) = *remotes;
+        remote_data->sck_sts.status = 2;
+        client_data->remote_alive_count--;
+        if(client_data->remote_alive_count == 0)
+            return __free_client_data(client_data);
     }
-    if(*client_data->remotes == NULL)
+    return 0;
+}
+
+static int __tcp_client_on_accepted(as_tcp_t *srv, as_tcp_t *clnt, void **data, as_socket_destroying_f *cb)
+{
+    struct sockaddr **dns_list;
+    struct sockaddr *dns_addr;
+    __client_data_t *client_data = (__client_data_t *) malloc(sizeof(__client_data_t));
+    if(client_data == NULL)
     {
-        free(client_data->remotes);
+        LOG_ERR(MSG_NOT_ENOUGH_MEMORY);
+        abort();
+    }
+    memset(client_data, 0, sizeof(__client_data_t));
+    client_data->first = NULL;
+    client_data->sck_sts.status = 1;
+    client_data->sck_sts.sck = (as_socket_t *) clnt;
+    client_data->remote_datas = (__remote_data_t *) calloc(all_dns_cnt, sizeof(__remote_data_t));
+    if(client_data->remote_datas == NULL)
+    {
+        LOG_ERR(MSG_NOT_ENOUGH_MEMORY);
+        abort();
+    }
+    __remote_data_t *remote_datas = client_data->remote_datas;
+    dns_list = china_dns_list;
+    while((dns_addr = *dns_list++) != NULL)
+    {
+        __remote_data_t *remote_data = remote_datas++;
+        remote_data->type = 1;
+        remote_data->client_data = client_data;
+        as_tcp_t *remote = as_tcp_init(as_socket_loop((as_socket_t *) clnt), remote_data, __remote_tcp_destroy);
+        if(as_tcp_connect(remote, dns_addr, __tcp_remote_on_connected) != 0)
+        {
+            remote_data->sck_sts.status = 2;
+            as_close((as_socket_t *) remote);
+            continue;
+        }
+        remote_data->sck_sts.status = 0;
+        remote_data->sck_sts.sck = (as_socket_t *) remote;
+        client_data->remote_alive_count++;
+    }
+    dns_list = trustable_dns_list;
+    while((dns_addr = *dns_list++) != NULL)
+    {
+        __remote_data_t *remote_data = remote_datas++;
+        remote_data->type = 2;
+        remote_data->client_data = client_data;
+        as_tcp_t *remote = as_tcp_init(as_socket_loop((as_socket_t *) clnt), remote_data, __remote_tcp_destroy);
+        if(as_tcp_connect(remote, dns_addr, __tcp_remote_on_connected) != 0)
+        {
+            remote_data->sck_sts.status = 2;
+            as_close((as_socket_t *) remote);
+            continue;
+        }
+        remote_data->sck_sts.status = 0;
+        remote_data->sck_sts.sck = (as_socket_t *) remote;
+        client_data->remote_alive_count++;
+    }
+    if(client_data->remote_alive_count == 0)
+    {
+        free(client_data->remote_datas);
         free(client_data);
+        return 1;
     }
-    return 0;
-}
-
-static int __tcp_client_on_connect(as_tcp_t *srv, as_tcp_t *clnt, void **data, as_socket_destroying_f *cb)
-{
-    int cnt = 0;
-    struct sockaddr **dns_list;
-    struct sockaddr *dns_addr;
-    dns_list = china_dns_list;
-    while(*dns_list++ != NULL)
-        cnt++;
-    dns_list = trustable_dns_list;
-    while(*dns_list++ != NULL)
-        cnt++;
-    __client_data_t *client_data = (__client_data_t *) malloc(sizeof(__client_data_t));
-    if(client_data == NULL)
-    {
-        LOG_ERR(MSG_NOT_ENOUGH_MEMORY);
-        abort();
-    }
-    client_data->first = NULL;
-    client_data->remotes = (as_socket_t **) malloc(sizeof(as_socket_t *) * (cnt + 1));
-    if(client_data->remotes == NULL)
-    {
-        LOG_ERR(MSG_NOT_ENOUGH_MEMORY);
-        abort();
-    }
-    if(pthread_mutex_init(&client_data->lock, NULL) != 0)
-    {
-        LOG_ERR(MSG_NOT_ENOUGH_MEMORY);
-        abort();
-    }
-    client_data->type = 1;
-    client_data->status = 1;
-    as_socket_t **remotes = client_data->remotes;
-    dns_list = china_dns_list;
-    while((dns_addr = *dns_list++) != NULL)
-    {
-        __remote_data_t *remote_data = (__remote_data_t *) malloc(sizeof(__remote_data_t));
-        if(remote_data == NULL)
-        {
-            LOG_ERR(MSG_NOT_ENOUGH_MEMORY);
-            abort();
-        }
-        remote_data->client = (as_socket_t *) clnt;
-        remote_data->client_data = client_data;
-        remote_data->type = 1;
-        remote_data->dns_addr = dns_addr;
-        remote_data->buf = NULL;
-        remote_data->len = 0;
-        remote_data->status = 0;
-        if(pthread_mutex_init(&remote_data->lock, NULL) != 0)
-        {
-            LOG_ERR(MSG_NOT_ENOUGH_MEMORY);
-            abort();
-        }
-        if(pthread_cond_init(&remote_data->signal, NULL) != 0)
-        {
-            LOG_ERR(MSG_NOT_ENOUGH_MEMORY);
-            abort();
-        }
-        as_tcp_t *remote = as_tcp_init(as_socket_loop((as_socket_t *) clnt), remote_data, __remote_tcp_destroy);
-        *remotes++ = (as_socket_t *) remote;
-        as_thread_task((as_socket_t *) remote, __tcp_connect_to_remote_thread, remote);
-    }
-    dns_list = trustable_dns_list;
-    while((dns_addr = *dns_list++) != NULL)
-    {
-        __remote_data_t *remote_data = (__remote_data_t *) malloc(sizeof(__remote_data_t));
-        if(remote_data == NULL)
-        {
-            LOG_ERR(MSG_NOT_ENOUGH_MEMORY);
-            abort();
-        }
-        remote_data->client = (as_socket_t *) clnt;
-        remote_data->client_data = client_data;
-        remote_data->type = 2;
-        remote_data->dns_addr = dns_addr;
-        remote_data->buf = NULL;
-        remote_data->len = 0;
-        remote_data->status = 0;
-        if(pthread_mutex_init(&remote_data->lock, NULL) != 0)
-        {
-            LOG_ERR(MSG_NOT_ENOUGH_MEMORY);
-            abort();
-        }
-        if(pthread_cond_init(&remote_data->signal, NULL) != 0)
-        {
-            LOG_ERR(MSG_NOT_ENOUGH_MEMORY);
-            abort();
-        }
-        as_tcp_t *remote = as_tcp_init(as_socket_loop((as_socket_t *) clnt), remote_data, __remote_tcp_destroy);
-        *remotes++ = (as_socket_t *) remote;
-        as_thread_task((as_socket_t *) remote, __tcp_connect_to_remote_thread, remote);
-    }
-    *remotes = NULL;
     *data = client_data;
     *cb = __client_destroy;
-    return as_tcp_read_start(clnt, __tcp_client_on_read);
+    return as_tcp_read_start(clnt, __tcp_client_on_read, 0);
 }
 
-static void *__tcp_connect_to_remote_thread(void *param)
+static int __tcp_remote_on_connected(as_tcp_t *remote, char status)
 {
-    LOG_DEBUG("thread started!\n");
-    as_tcp_t *remote = (as_tcp_t *) param;
     __remote_data_t *remote_data = (__remote_data_t *) as_socket_data((as_socket_t *) remote);
-    while(1)
-    {
-        if(remote_data->status == 2)
-            break;
-        if(as_tcp_connect(remote, remote_data->dns_addr) != 0)
-            break;
-        if(remote_data->status == 2)
-            break;
-        if(as_tcp_read_start(remote, __tcp_remote_on_read) != 0)
-            break;
-        if(remote_data->status == 0)
-            remote_data->status = 1;
-        else
-            break;
-        pthread_mutex_lock(&remote_data->lock);
-        while(1)
-        {
-            if(remote_data->status == 2)
-            {
-                pthread_mutex_unlock(&remote_data->lock);
-                break;
-            }
-            if(remote_data->len != 0)
-            {
-                int rcode = as_tcp_write(remote, remote_data->buf, remote_data->len);
-                free(remote_data->buf);
-                remote_data->len = 0;
-                if(rcode <= 0)
-                {
-                    pthread_mutex_unlock(&remote_data->lock);
-                    break;
-                }
-            }
-            pthread_cond_wait(&remote_data->signal, &remote_data->lock);
-        }
-        break;
-    }
-    pthread_mutex_lock(&remote_data->lock);
-    while(1)
-    {
-        if(remote_data->status == 2)
-            break;
-        pthread_cond_wait(&remote_data->signal, &remote_data->lock);
-    }
-    pthread_mutex_unlock(&remote_data->lock);
-    LOG_DEBUG("thread end!\n");
-    if(remote_data->len != 0)
-    {
-        free(remote_data->buf);
-    }
-    free(remote_data);
-    return NULL;
+    if(status != 0)
+        return 1;
+    remote_data->sck_sts.status = 1;
+    __tcp_remote_writing(remote);
+    return as_tcp_read_start(remote, __tcp_remote_on_read, AS_READ_ONESHOT);
 }
 
-static int __tcp_remote_on_read(as_tcp_t *remote, __const__ char *buf, __const__ int len)
+static int __tcp_remote_writing(as_tcp_t *remote)
 {
-    char can_send = 0;
-    struct sockaddr_storage addr;
     __remote_data_t *remote_data = (__remote_data_t *) as_socket_data((as_socket_t *) remote);
-    as_tcp_t *client = (as_tcp_t *) remote_data->client;
     __client_data_t *client_data = remote_data->client_data;
-    pthread_mutex_lock(&client_data->lock);
-    if(client_data->first == NULL || client_data->first == (as_socket_t *) remote)
+    if(remote_data->read_pos < client_data->arr_len)
     {
-        LOG_INFO("recv from: %s\n", address_str((struct sockaddr *) as_dest_addr((as_socket_t *) remote)));
-        int rcode = __parse_dns_protocol((char *) buf, len, (struct sockaddr *) &addr, 1);
-        if(rcode == 0)
-        {
-            LOG_DEBUG("parsed dns addr = %s\n", address_str((struct sockaddr *) &addr));
-            if(cidr_match(cidr, (struct sockaddr *) &addr))
-            {
-                if(conf.mode == 1 && remote_data->type == 1)
-                    can_send = 1;
-                if(conf.mode == 2 && remote_data->type == 2)
-                    can_send = 1;
-            }
-            else
-            {
-                if(conf.mode == 1 && remote_data->type == 2)
-                    can_send = 1;
-                if(conf.mode == 2 && remote_data->type == 1)
-                    can_send = 1;
-            }
-        }
-        else
-        {
-            LOG_DEBUG("parsed dns addr failed\n");
-            if(rcode == -1)
-                can_send = 1;
-        }
-    }
-    if(can_send == 1)
-    {
-        LOG_DEBUG("send response\n");
-        client_data->first = (as_socket_t *) remote;
-        if(client_data->status != 0)
-            as_tcp_write(client, buf, len);
-    }
-    pthread_mutex_unlock(&client_data->lock);
-    return 0;
-}
-
-static int __tcp_client_on_read(as_tcp_t *clnt, __const__ char *buf, __const__ int len)
-{
-    __client_data_t *client_data = (__client_data_t *) as_socket_data((as_socket_t *) clnt);
-    as_socket_t **remotes = client_data->remotes;
-    as_socket_t *remote;
-    __remote_data_t *remote_data;
-    while((remote = *remotes++) != NULL)
-    {
-        remote_data = (__remote_data_t *) as_socket_data(remote);
-        pthread_mutex_lock(&remote_data->lock);
-        if(remote_data->len == 0)
-        {
-            remote_data->buf = (char *) malloc(len);
-            memcpy(remote_data->buf, buf, len);
-            remote_data->len = len;
-        }
-        else
-        {
-            remote_data->buf = (char *) realloc(remote_data->buf, remote_data->len + len);
-            memcpy(remote_data->buf + remote_data->len, buf, len);
-            remote_data->len += len;
-        }
-        pthread_cond_broadcast(&remote_data->signal);
-        pthread_mutex_unlock(&remote_data->lock);
+        remote_data->sck_sts.on_send = 1;
+        as_tcp_write(remote, client_data->buf_arr[remote_data->read_pos], client_data->buf_len_arr[remote_data->read_pos], __tcp_remote_on_wrote);
     }
     return 0;
 }
 
-static int __udp_client_on_connect(as_udp_t *srv, as_udp_t *clnt, void **data, as_socket_destroying_f *cb)
+static int __tcp_remote_on_wrote(as_tcp_t *remote, __const__ unsigned char *buf, __const__ size_t len)
 {
-    int cnt = 0;
-    struct sockaddr **dns_list;
-    struct sockaddr *dns_addr;
-    dns_list = china_dns_list;
-    while(*dns_list++ != NULL)
-        cnt++;
-    dns_list = trustable_dns_list;
-    while(*dns_list++ != NULL)
-        cnt++;
-    __client_data_t *client_data = (__client_data_t *) malloc(sizeof(__client_data_t));
-    if(client_data == NULL)
-    {
-        LOG_ERR(MSG_NOT_ENOUGH_MEMORY);
-        abort();
-    }
-    client_data->first = NULL;
-    client_data->remotes = (as_socket_t **) malloc(sizeof(as_socket_t *) * (cnt + 1));
-    if(client_data->remotes == NULL)
-    {
-        LOG_ERR(MSG_NOT_ENOUGH_MEMORY);
-        abort();
-    }
-    if(pthread_mutex_init(&client_data->lock, NULL) != 0)
-    {
-        LOG_ERR(MSG_NOT_ENOUGH_MEMORY);
-        abort();
-    }
-    client_data->type = 2;
-    client_data->status = 1;
-    as_socket_t **remotes = client_data->remotes;
-    dns_list = china_dns_list;
-    while((dns_addr = *dns_list++) != NULL)
-    {
-        __remote_data_t *remote_data = (__remote_data_t *) malloc(sizeof(__remote_data_t));
-        if(remote_data == NULL)
-        {
-            LOG_ERR(MSG_NOT_ENOUGH_MEMORY);
-            abort();
-        }
-        remote_data->client = (as_socket_t *) clnt;
-        remote_data->client_data = client_data;
-        remote_data->type = 1;
-        remote_data->dns_addr = dns_addr;
-        remote_data->len = 0;
-        remote_data->status = 0;
-        as_udp_t *remote = as_udp_init(as_socket_loop((as_socket_t *) clnt), remote_data, __remote_udp_destroy);
-        *remotes++ = (as_socket_t *) remote;
-        if(as_udp_connect(remote, dns_addr) != 0)
-            continue;
-        as_udp_read_start(remote, __udp_remote_on_read);
-        remote_data->status = 1;
-    }
-    dns_list = trustable_dns_list;
-    while((dns_addr = *dns_list++) != NULL)
-    {
-        __remote_data_t *remote_data = (__remote_data_t *) malloc(sizeof(__remote_data_t));
-        if(remote_data == NULL)
-        {
-            LOG_ERR(MSG_NOT_ENOUGH_MEMORY);
-            abort();
-        }
-        remote_data->client = (as_socket_t *) clnt;
-        remote_data->client_data = client_data;
-        remote_data->type = 2;
-        remote_data->dns_addr = dns_addr;
-        remote_data->len = 0;
-        remote_data->status = 0;
-        as_udp_t *remote = as_udp_init(as_socket_loop((as_socket_t *) clnt), remote_data, __remote_udp_destroy);
-        *remotes++ = (as_socket_t *) remote;
-        if(as_udp_connect(remote, dns_addr) != 0)
-            continue;
-        as_udp_read_start(remote, __udp_remote_on_read);
-        remote_data->status = 1;
-    }
-    *remotes = NULL;
-    *data = client_data;
-    *cb = __client_destroy;
-    return as_udp_read_start(clnt, __udp_client_on_read);
+    __remote_data_t *remote_data = (__remote_data_t *) as_socket_data((as_socket_t *) remote);
+    remote_data->read_pos++;
+    remote_data->sck_sts.on_send = 0;
+    return __tcp_remote_writing(remote);
 }
 
-static int __udp_client_on_read(as_udp_t *clnt, __const__ struct msghdr *msg, __const__ char *buf, __const__ int len)
-{
-    __client_data_t *client_data = (__client_data_t *) as_socket_data((as_socket_t *) clnt);
-    as_socket_t **remotes = client_data->remotes;
-    as_socket_t *remote;
-    while((remote = *remotes++) != NULL)
-        as_udp_write((as_udp_t *) remote, buf, len);
-    return 0;
-}
-
-static int __udp_remote_on_read(as_udp_t *remote, __const__ struct msghdr *msg, __const__ char *buf, __const__ int len)
+static int __tcp_remote_on_read(as_tcp_t *remote, __const__ struct msghdr *msg, __const__ unsigned char *buf, __const__ size_t len)
 {
     char can_send = 0;
+    char is_find = 0;
     int rcode;
     struct sockaddr_storage addr;
     __remote_data_t *remote_data = (__remote_data_t *) as_socket_data((as_socket_t *) remote);
-    as_udp_t *client = (as_udp_t *) remote_data->client;
     __client_data_t *client_data = remote_data->client_data;
-    pthread_mutex_lock(&client_data->lock);
+    as_tcp_t *client = (as_tcp_t *) client_data->sck_sts.sck;
     if(client_data->first == NULL || client_data->first == (as_socket_t *) remote)
     {
         LOG_DEBUG("recv from: %s\n", address_str((struct sockaddr *) as_dest_addr((as_socket_t *) remote)));
-        rcode = __parse_dns_protocol((char *) buf, len, (struct sockaddr *) &addr, 2);
+        dns_prtcl_t dns_prtcl;
+        rcode = dns_response_parse(buf + 2, len - 2, &dns_prtcl);
         if(rcode == 0)
         {
-            LOG_DEBUG("parsed dns addr = %s\n", address_str((struct sockaddr *) &addr));
-            if(cidr_match(cidr, (struct sockaddr *) &addr))
+            for(int i = 0; i < dns_prtcl.header.an_count; i++)
             {
-                if(conf.mode == 1 && remote_data->type == 1)
-                    can_send = 1;
-                if(conf.mode == 2 && remote_data->type == 2)
-                    can_send = 1;
+                if(dns_prtcl.answer[i].type == 0x01)
+                {
+                    struct sockaddr_in *addr_in = (struct sockaddr_in *) &addr;
+                    addr_in->sin_family = AF_INET;
+                    memcpy(&addr_in->sin_addr, dns_prtcl.answer[i].data, 4);
+                    is_find = 1;
+                    break;
+                }
+                else if(dns_prtcl.answer[i].type == 0x1c)
+                {
+                    struct sockaddr_in6 *addr_in6 = (struct sockaddr_in6 *) &addr;
+                    addr_in6->sin6_family = AF_INET;
+                    memcpy(&addr_in6->sin6_addr, dns_prtcl.answer[i].data, 16);
+                    is_find = 1;
+                    break;
+                }
+            }
+            if(is_find)
+            {
+                LOG_DEBUG("resolv host %s to %s\n", dns_prtcl.question[0].query, address_without_port_str((struct sockaddr *) &addr));
+                if(cidr_match(cidr, (struct sockaddr *) &addr))
+                {
+                    if(conf.mode == 1 && remote_data->type == 1)
+                        can_send = 1;
+                    if(conf.mode == 2 && remote_data->type == 2)
+                        can_send = 1;
+                }
+                else
+                {
+                    if(conf.mode == 1 && remote_data->type == 2)
+                        can_send = 1;
+                    if(conf.mode == 2 && remote_data->type == 1)
+                        can_send = 1;
+                }
             }
             else
             {
-                if(conf.mode == 1 && remote_data->type == 2)
-                    can_send = 1;
-                if(conf.mode == 2 && remote_data->type == 1)
+                if(remote_data->type == 2)
                     can_send = 1;
             }
+            dns_prtcl_free(&dns_prtcl);
         }
         else
         {
-            LOG_DEBUG("parsed dns addr failed\n");
-            if(remote_data->type == 2)
-                can_send = 1;
+            LOG_ERR("resolv failed\n");
         }
     }
     if(can_send == 1)
     {
         LOG_DEBUG("send response\n");
-        if(rcode == 0)
+        if(is_find)
         {
             LOG_INFO("query dns success, matched dns server: %s, ip = %s\n", address_str((struct sockaddr *) as_dest_addr((as_socket_t *) remote)), address_without_port_str((struct sockaddr *) &addr));
         }
@@ -933,9 +654,219 @@ static int __udp_remote_on_read(as_udp_t *remote, __const__ struct msghdr *msg, 
             LOG_INFO("query dns failed, matched dns server: %s\n", address_str((struct sockaddr *) as_dest_addr((as_socket_t *) remote)));
         }
         client_data->first = (as_socket_t *) remote;
-        if(client_data->status != 0)
-            as_udp_write(client, buf, len);
+        as_tcp_write(client, buf, len, NULL);
     }
-    pthread_mutex_unlock(&client_data->lock);
+    return 0;
+}
+
+static int __tcp_client_on_read(as_tcp_t *clnt, __const__ struct msghdr *msg, __const__ unsigned char *buf, __const__ size_t len)
+{
+    __client_data_t *client_data = (__client_data_t *) as_socket_data((as_socket_t *) clnt);
+    size_t cnt = all_dns_cnt;
+    __remote_data_t *remote_datas = client_data->remote_datas;
+    __remote_data_t *remote_data;
+    if(client_data->arr_len == 0)
+    {
+        client_data->buf_arr = malloc(sizeof(unsigned char *));
+        client_data->buf_len_arr = malloc(sizeof(size_t));
+    }
+    else
+    {
+        client_data->buf_arr = realloc(client_data->buf_arr, sizeof(unsigned char *) * (client_data->arr_len + 1));
+        client_data->buf_len_arr = realloc(client_data->buf_len_arr, sizeof(size_t) * (client_data->arr_len + 1));
+
+    }
+    if(client_data->buf_arr == NULL || client_data->buf_len_arr == NULL)
+    {
+        LOG_ERR(MSG_NOT_ENOUGH_MEMORY);
+        abort();
+    }
+    client_data->buf_arr[client_data->arr_len] = malloc(len);
+    if(client_data->buf_arr[client_data->arr_len] == NULL)
+    {
+        LOG_ERR(MSG_NOT_ENOUGH_MEMORY);
+        abort();
+    }
+    memcpy(client_data->buf_arr[client_data->arr_len], buf, len);
+    client_data->buf_len_arr[client_data->arr_len] = len;
+    client_data->arr_len++;
+    while(cnt--) 
+    {
+        remote_data = remote_datas++;
+        if(remote_data->sck_sts.status == 1 && remote_data->sck_sts.on_send == 0)
+        {
+            __tcp_remote_writing((as_tcp_t *) remote_data->sck_sts.sck);
+        }
+    }
+    return 0;
+}
+
+static int __udp_client_on_connect(as_udp_t *srv, as_udp_t *clnt, void **data, as_socket_destroying_f *cb)
+{
+    struct sockaddr **dns_list;
+    struct sockaddr *dns_addr;
+    __client_data_t *client_data = (__client_data_t *) malloc(sizeof(__client_data_t));
+    if(client_data == NULL)
+    {
+        LOG_ERR(MSG_NOT_ENOUGH_MEMORY);
+        abort();
+    }
+    memset(client_data, 0, sizeof(__client_data_t));
+    client_data->first = NULL;
+    client_data->sck_sts.status = 1;
+    client_data->sck_sts.sck = (as_socket_t *) clnt;
+    client_data->remote_datas = (__remote_data_t *) calloc(all_dns_cnt + 1, sizeof(__remote_data_t));
+    if(client_data->remote_datas == NULL)
+    {
+        LOG_ERR(MSG_NOT_ENOUGH_MEMORY);
+        abort();
+    }
+    __remote_data_t *remote_datas = client_data->remote_datas;
+    dns_list = china_dns_list;
+    while((dns_addr = *dns_list++) != NULL)
+    {
+        __remote_data_t *remote_data = remote_datas++;
+        remote_data->type = 1;
+        remote_data->client_data = client_data;
+        as_udp_t *remote = as_udp_init(as_socket_loop((as_socket_t *) clnt), remote_data, __remote_udp_destroy);
+        if(as_udp_connect(remote, dns_addr) != 0)
+        {
+            remote_data->sck_sts.status = 2;
+            as_close((as_socket_t *) remote);
+            continue;
+        }
+        remote_data->sck_sts.status = 1;
+        remote_data->sck_sts.sck = (as_socket_t *) remote;
+        client_data->remote_alive_count++;
+    }
+    dns_list = trustable_dns_list;
+    while((dns_addr = *dns_list++) != NULL)
+    {
+        __remote_data_t *remote_data = remote_datas++;
+        remote_data->type = 2;
+        remote_data->client_data = client_data;
+        as_udp_t *remote = as_udp_init(as_socket_loop((as_socket_t *) clnt), remote_data, __remote_udp_destroy);
+        if(as_udp_connect(remote, dns_addr) != 0)
+        {
+            remote_data->sck_sts.status = 2;
+            as_close((as_socket_t *) remote);
+            continue;
+        }
+        remote_data->sck_sts.status = 1;
+        remote_data->sck_sts.sck = (as_socket_t *) remote;
+        client_data->remote_alive_count++;
+    }
+    if(client_data->remote_alive_count == 0)
+    {
+        free(client_data->remote_datas);
+        free(client_data);
+        return 1;
+    }
+    *data = client_data;
+    *cb = __client_destroy;
+    return as_udp_read_start(clnt, __udp_client_on_read, 0);
+}
+
+static int __udp_client_on_read(as_udp_t *clnt, __const__ struct msghdr *msg, __const__ unsigned char *buf, __const__ size_t len)
+{
+    int cnt = all_dns_cnt;
+    __client_data_t *client_data = (__client_data_t *) as_socket_data((as_socket_t *) clnt);
+    __remote_data_t *remote_datas = client_data->remote_datas;
+    __remote_data_t *remote_data;
+    while(cnt--)
+    {
+        remote_data = remote_datas++;
+        if(remote_data->sck_sts.status == 1)
+        {
+            as_udp_write((as_udp_t *) remote_data->sck_sts.sck, buf, len, __udp_remote_on_wrote);
+        }
+    }
+    return 0;
+}
+
+static int __udp_remote_on_wrote(as_udp_t *remote, __const__ unsigned char *buf, __const__ size_t len)
+{
+    return as_udp_read_start(remote, __udp_remote_on_read, AS_READ_ONESHOT);
+}
+
+static int __udp_remote_on_read(as_udp_t *remote, __const__ struct msghdr *msg, __const__ unsigned char *buf, __const__ size_t len)
+{
+    char can_send = 0;
+    char is_find = 0;
+    int rcode;
+    struct sockaddr_storage addr;
+    __remote_data_t *remote_data = (__remote_data_t *) as_socket_data((as_socket_t *) remote);
+    __client_data_t *client_data = remote_data->client_data;
+    as_udp_t *client = (as_udp_t *) client_data->sck_sts.sck;
+    if(client_data->first == NULL || client_data->first == (as_socket_t *) remote)
+    {
+        LOG_DEBUG("recv from: %s\n", address_str((struct sockaddr *) as_dest_addr((as_socket_t *) remote)));
+        dns_prtcl_t dns_prtcl;
+        rcode = dns_response_parse(buf, len, &dns_prtcl);
+        if(rcode == 0)
+        {
+            for(int i = 0; i < dns_prtcl.header.an_count; i++)
+            {
+                if(dns_prtcl.answer[i].type == 0x01)
+                {
+                    struct sockaddr_in *addr_in = (struct sockaddr_in *) &addr;
+                    addr_in->sin_family = AF_INET;
+                    memcpy(&addr_in->sin_addr, dns_prtcl.answer[i].data, 4);
+                    is_find = 1;
+                    break;
+                }
+                else if(dns_prtcl.answer[i].type == 0x1c)
+                {
+                    struct sockaddr_in6 *addr_in6 = (struct sockaddr_in6 *) &addr;
+                    addr_in6->sin6_family = AF_INET;
+                    memcpy(&addr_in6->sin6_addr, dns_prtcl.answer[i].data, 16);
+                    is_find = 1;
+                    break;
+                }
+            }
+            if(is_find)
+            {
+                LOG_DEBUG("resolv host %s to %s\n", dns_prtcl.question[0].query, address_without_port_str((struct sockaddr *) &addr));
+                if(cidr_match(cidr, (struct sockaddr *) &addr))
+                {
+                    if(conf.mode == 1 && remote_data->type == 1)
+                        can_send = 1;
+                    if(conf.mode == 2 && remote_data->type == 2)
+                        can_send = 1;
+                }
+                else
+                {
+                    if(conf.mode == 1 && remote_data->type == 2)
+                        can_send = 1;
+                    if(conf.mode == 2 && remote_data->type == 1)
+                        can_send = 1;
+                }
+            }
+            else
+            {
+                if(remote_data->type == 2)
+                    can_send = 1;
+            }
+            dns_prtcl_free(&dns_prtcl);
+        }
+        else
+        {
+            LOG_ERR("resolv failed\n");
+        }
+    }
+    if(can_send == 1)
+    {
+        LOG_DEBUG("send response\n");
+        if(is_find)
+        {
+            LOG_INFO("query dns success, matched dns server: %s, ip = %s\n", address_str((struct sockaddr *) as_dest_addr((as_socket_t *) remote)), address_without_port_str((struct sockaddr *) &addr));
+        }
+        else
+        {
+            LOG_INFO("query dns failed, matched dns server: %s\n", address_str((struct sockaddr *) as_dest_addr((as_socket_t *) remote)));
+        }
+        client_data->first = (as_socket_t *) remote;
+        as_udp_write(client, buf, len, NULL);
+    }
     return 0;
 }

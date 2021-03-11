@@ -295,8 +295,7 @@ bool cidr_match(cidr_t *cidr, struct sockaddr *addr)
         char *sql = "select 1 as col from cidr4 where %u >= sip and %u <= eip;";
         struct sockaddr_in *addr4 = (struct sockaddr_in *) addr;
         ips = (uint32_t *) &addr4->sin_addr;
-        *ips = ntohl(*ips);
-        sprintf(buf, sql, *ips, *ips);
+        sprintf(buf, sql, ntohl(*ips), ntohl(*ips));
         rc = sqlite3_exec(cidr, buf, __select_cb, (void*) &exists, &err_msg);
         if(rc != SQLITE_OK)
             sqlite3_free(err_msg);

@@ -8,16 +8,21 @@ PREFIX_BIN = $(PREFIX)/$(BINDIR)
 
 BIN = $(BINDIR)/ac-dns
 
-CFLAGS += -Os -Wall
-LDFLAGS += -liniparser -lpthread -lsqlite3
+CFLAGS += -Wall
+LDFLAGS += -liniparser -lsqlite3
 
-ifdef DEBUG
-CFLAGS += -DDEBUG -g
-else
-LDFLAGS += -s
+ifeq ($(OS),Windows_NT)
+CFLAGS += -D_WIN32_WINNT=0x0600
+LDFLAGS += -lws2_32 -lIphlpapi
 endif
 
-SOURCES = ascore.c common.c iconf.c thrdpool.c dns.c cidr.c
+ifeq ($(DEBUG),1)
+CFLAGS += -DDEBUG -g -O0
+else
+LDFLAGS += -s -Os
+endif
+
+SOURCES = ascore.c common.c iconf.c dns.c cidr.c dnsprot.c
 OBJECTS = $(patsubst %.c,$(OBJDIR)/%.o,$(SOURCES))
 
 all: $(BIN)
