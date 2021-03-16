@@ -28,7 +28,7 @@ int __dns_query_parse(__const__ unsigned char *data, __const__ size_t len, int *
         {
             if(*pos + 2 > len)
                 return 1;
-            int tpos = *(pdata + 1);
+            int tpos = ((*pdata & 0x3f) << 8) | *(pdata + 1);
             if(__dns_query_parse(data, len, &tpos, str, str_len) != 0)
                 return 1;
             pdata += 2;
