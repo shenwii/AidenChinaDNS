@@ -68,6 +68,7 @@ struct as_loop_s
     fd_set write_set;
     fd_set except_set;
 #endif
+    char dns_server_inited;
     struct sockaddr_storage dns_server;
 };
 
@@ -126,6 +127,7 @@ struct as_udp_s
     as_udp_read_f read_cb;
     time_t dns_request_time;
     int dns_try_cnt;
+    int ipv6_first;
     unsigned char *dns_buf;
     size_t dns_buf_len;
 };
@@ -176,16 +178,180 @@ static int __get_socket_error(int fd, char *serrno)
     return getsockopt(fd, SOL_SOCKET, SO_ERROR, serrno, &len);
 }
 
-int __dns_priority(dns_resr_t *dns_resr)
+static int __dns_server(struct sockaddr *addr)
+{
+#if defined _WIN32 || defined __CYGWIN__
+    IP_ADAPTER_ADDRESSES *ad_address = NULL;
+    IP_ADAPTER_ADDRESSES *cur_address = NULL;
+    ULONG buffer_len = 16 * 1024 * 1024;
+    IP_ADAPTER_DNS_SERVER_ADDRESS *dns_server = NULL;
+    ad_address = (IP_ADAPTER_ADDRESSES *) malloc(buffer_len);
+    if(ad_address == NULL)
+    {
+        LOG_ERR(MSG_NOT_ENOUGH_MEMORY);
+        abort();
+    }
+    if(GetAdaptersAddresses(AF_UNSPEC, GAA_FLAG_INCLUDE_PREFIX, NULL, ad_address, &buffer_len) != 0)
+    {
+        LOG_WARN(MSG_DNS_NAMESERVER_NOT_FOUND);
+        return 1;
+    }
+    for(cur_address = ad_address; cur_address != NULL; cur_address = cur_address->Next)
+    {
+        for(dns_server = cur_address->FirstDnsServerAddress; dns_server != NULL; dns_server = dns_server->Next)
+        {
+            if(dns_server->Address.lpSockaddr->sa_family == AF_INET6)
+            {
+                memcpy(addr, dns_server->Address.lpSockaddr, sizeof(struct sockaddr_in6));
+                ((struct sockaddr_in6 *) addr)->sin6_port = htons(53);
+            }
+            else if(dns_server->Address.lpSockaddr->sa_family == AF_INET)
+            {
+                memcpy(addr, dns_server->Address.lpSockaddr, sizeof(struct sockaddr_in));
+                ((struct sockaddr_in *) addr)->sin_port = htons(53);
+            }
+            else
+            {
+                continue;
+            }
+            return 0;
+        }
+    }
+    LOG_WARN(MSG_DNS_NAMESERVER_NOT_FOUND);
+    return 1;
+#else
+    int c;
+    char is_comment = 0;
+    char key[80];
+    char value[80];
+    int ikey = 0;
+    int ivalue = 0;
+    int type = 0;
+    struct sockaddr_in6 *in_addr6 = (struct sockaddr_in6 *) addr;
+    struct sockaddr_in *in_addr = (struct sockaddr_in *) addr;
+    FILE *resolv_file = fopen(_PATH_RESCONF, "r");
+    if(resolv_file == NULL)
+    {
+        LOG_WARN(MSG_OPEN_FILE, _PATH_RESCONF);
+        return 1;
+    }
+    while((c = fgetc(resolv_file)) != EOF)
+    {
+        switch (c)
+        {
+        case '\n':
+            key[ikey++] = '\0';
+            value[ivalue++] = '\0';
+            if(strcmp(key, "nameserver") == 0)
+            {
+                int rtn = inet_pton(AF_INET6, value, &in_addr6->sin6_addr);
+                if(rtn == 1)
+                {
+                    in_addr6->sin6_family = AF_INET6;
+                    in_addr6->sin6_port = htons(53);
+                    fclose(resolv_file);
+                    return 0;
+                }
+                rtn = inet_pton(AF_INET, value, &in_addr->sin_addr);
+                if(rtn == 1)
+                {
+                    in_addr->sin_family = AF_INET;
+                    in_addr->sin_port = htons(53);
+                    fclose(resolv_file);
+                    return 0;
+                }
+            }
+            ikey = 0;
+            ivalue = 0;
+            type = 0;
+            is_comment = 0;
+            break;
+        case '\r':
+        case ' ':
+        case '\t':
+        case '\f':
+        case '\v':
+            if(type == 1)
+            {
+                type = 2;
+            }
+            if(type == 3)
+            {
+                type = 4;
+            }
+            break;
+        case '#':
+            is_comment = 1;
+            break;
+        default:
+            if(is_comment)
+                continue;
+            if(type == 0 || type == 1)
+            {
+                if(ikey < 80 - 1)
+                    key[ikey++] = c;
+                type = 1;
+            }
+            if(type == 2 || type == 3)
+            {
+                if(ivalue < 80 - 1)
+                    value[ivalue++] = c;
+                type = 3;
+            }
+            break;
+        }
+    }
+    fclose(resolv_file);
+    if(type >= 3)
+    {
+        key[ikey++] = '\0';
+        value[ivalue++] = '\0';
+        if(strcmp(key, "nameserver") == 0)
+        {
+            int rtn = inet_pton(AF_INET6, value, &in_addr6->sin6_addr);
+            if(rtn == 1)
+            {
+                in_addr6->sin6_family = AF_INET6;
+                in_addr6->sin6_port = htons(53);
+                fclose(resolv_file);
+                return 0;
+            }
+            rtn = inet_pton(AF_INET, value, &in_addr->sin_addr);
+            if(rtn == 1)
+            {
+                in_addr->sin_family = AF_INET;
+                in_addr->sin_port = htons(53);
+                fclose(resolv_file);
+                return 0;
+            }
+        }
+    }
+    LOG_WARN(MSG_DNS_NAMESERVER_NOT_FOUND);
+    return 1;
+#endif
+
+}
+
+int __dns_priority(dns_resr_t *dns_resr, int ipv6_first)
 {
     if(dns_resr->type == 0x1c)
-        return 1;
+    {
+        if(ipv6_first)
+            return 1;
+        else
+            return 2;
+    }
     if(dns_resr->type == 0x01)
-        return 2;
+    {
+        if(ipv6_first)
+            return 2;
+        else
+            return 1;
+    }
     return 99;
 }
 
-void __dns_rspn_filter(dns_data_t *dns_data)
+void __dns_rspn_filter(dns_data_t *dns_data, int ipv6_first)
 {
     struct sockaddr_storage addr;
     dns_prtcl_t *tdp;
@@ -209,7 +375,7 @@ void __dns_rspn_filter(dns_data_t *dns_data)
             tdr = &tdp->answer[j];
             if(tdr->type != 0x01 && tdr->type != 0x1c)
                 continue;
-            tpl = __dns_priority(tdr);
+            tpl = __dns_priority(tdr, ipv6_first);
             if(tpl < pl)
             {
                 presrc = tdr;
@@ -342,7 +508,7 @@ static void __socket_loop_event(as_loop_t *loop)
                     dns_data_t *dns_data = (dns_data_t *) udp->sck.data;
                     dns_data->dns_recved_cnt++;
                     if(dns_data->dns_recved_cnt == 2)
-                        __dns_rspn_filter(dns_data);
+                        __dns_rspn_filter(dns_data, udp->ipv6_first);
                     as_close(s);
                 }
                 else
@@ -902,7 +1068,7 @@ int __udp_dns_read_callback(as_udp_t *udp, __const__ struct msghdr *msg, __const
         }
     }
     if(dns_data->dns_recved_cnt == 2)
-        __dns_rspn_filter(dns_data);
+        __dns_rspn_filter(dns_data, udp->ipv6_first);
     as_close((as_socket_t *) udp);
     return 0;
 }
@@ -984,155 +1150,7 @@ as_loop_t *as_loop_init()
         abort();
     }
 #endif
-#if defined _WIN32 || defined __CYGWIN__
-    IP_ADAPTER_ADDRESSES *ad_address = NULL;
-    IP_ADAPTER_ADDRESSES *cur_address = NULL;
-    ULONG buffer_len = 16 * 1024 * 1024;
-    IP_ADAPTER_DNS_SERVER_ADDRESS *dns_server = NULL;
-    ad_address = (IP_ADAPTER_ADDRESSES *) malloc(buffer_len);
-    if(ad_address == NULL)
-    {
-        LOG_ERR(MSG_NOT_ENOUGH_MEMORY);
-        abort();
-    }
-    if(GetAdaptersAddresses(AF_UNSPEC, GAA_FLAG_INCLUDE_PREFIX, NULL, ad_address, &buffer_len) != 0)
-    {
-        LOG_ERR(MSG_DNS_NAMESERVER_NOT_FOUND);
-        abort();
-    }
-    for(cur_address = ad_address; cur_address != NULL; cur_address = cur_address->Next)
-    {
-        for(dns_server = cur_address->FirstDnsServerAddress; dns_server != NULL; dns_server = dns_server->Next)
-        {
-            if(dns_server->Address.lpSockaddr->sa_family == AF_INET6)
-            {
-                memcpy(&loop->dns_server, dns_server->Address.lpSockaddr, sizeof(struct sockaddr_in6));
-                ((struct sockaddr_in6 *) &loop->dns_server)->sin6_port = htons(53);
-            }
-            else if(dns_server->Address.lpSockaddr->sa_family == AF_INET)
-            {
-                memcpy(&loop->dns_server, dns_server->Address.lpSockaddr, sizeof(struct sockaddr_in));
-                ((struct sockaddr_in *) &loop->dns_server)->sin_port = htons(53);
-            }
-            else
-            {
-                continue;
-            }
-            return loop;
-        }
-    }
-    LOG_ERR(MSG_DNS_NAMESERVER_NOT_FOUND);
-    abort();
-#else
-    int c;
-    char is_comment = 0;
-    char key[80];
-    char value[80];
-    int ikey = 0;
-    int ivalue = 0;
-    int type = 0;
-    struct sockaddr_in6 *in_addr6 = (struct sockaddr_in6 *) &loop->dns_server;
-    struct sockaddr_in *in_addr = (struct sockaddr_in *) &loop->dns_server;
-    FILE *resolv_file = fopen(_PATH_RESCONF, "r");
-    if(resolv_file == NULL)
-    {
-        LOG_ERR(MSG_OPEN_FILE, _PATH_RESCONF);
-        abort();
-    }
-    while((c = fgetc(resolv_file)) != EOF)
-    {
-        switch (c)
-        {
-        case '\n':
-            key[ikey++] = '\0';
-            value[ivalue++] = '\0';
-            if(strcmp(key, "nameserver") == 0)
-            {
-                int rtn = inet_pton(AF_INET6, value, &in_addr6->sin6_addr);
-                if(rtn == 1)
-                {
-                    in_addr6->sin6_family = AF_INET6;
-                    in_addr6->sin6_port = htons(53);
-                    fclose(resolv_file);
-                    return loop;
-                }
-                rtn = inet_pton(AF_INET, value, &in_addr->sin_addr);
-                if(rtn == 1)
-                {
-                    in_addr->sin_family = AF_INET;
-                    in_addr->sin_port = htons(53);
-                    fclose(resolv_file);
-                    return loop;
-                }
-            }
-            ikey = 0;
-            ivalue = 0;
-            type = 0;
-            is_comment = 0;
-            break;
-        case '\r':
-        case ' ':
-        case '\t':
-        case '\f':
-        case '\v':
-            if(type == 1)
-            {
-                type = 2;
-            }
-            if(type == 3)
-            {
-                type = 4;
-            }
-            break;
-        case '#':
-            is_comment = 1;
-            break;
-        default:
-            if(is_comment)
-                continue;
-            if(type == 0 || type == 1)
-            {
-                if(ikey < 80 - 1)
-                    key[ikey++] = c;
-                type = 1;
-            }
-            if(type == 2 || type == 3)
-            {
-                if(ivalue < 80 - 1)
-                    value[ivalue++] = c;
-                type = 3;
-            }
-            break;
-        }
-    }
-    fclose(resolv_file);
-    if(type >= 3)
-    {
-        key[ikey++] = '\0';
-        value[ivalue++] = '\0';
-        if(strcmp(key, "nameserver") == 0)
-        {
-            int rtn = inet_pton(AF_INET6, value, &in_addr6->sin6_addr);
-            if(rtn == 1)
-            {
-                in_addr6->sin6_family = AF_INET6;
-                in_addr6->sin6_port = htons(53);
-                fclose(resolv_file);
-                return loop;
-            }
-            rtn = inet_pton(AF_INET, value, &in_addr->sin_addr);
-            if(rtn == 1)
-            {
-                in_addr->sin_family = AF_INET;
-                in_addr->sin_port = htons(53);
-                fclose(resolv_file);
-                return loop;
-            }
-        }
-    }
-    LOG_ERR(MSG_DNS_NAMESERVER_NOT_FOUND);
-    abort();
-#endif
+    loop->dns_server_inited = 0;
     return loop;
 }
 
@@ -1612,7 +1630,7 @@ int as_udp_write(as_udp_t *udp, __const__ unsigned char *buf, __const__ size_t l
     return 0;
 }
 
-int as_resolver(as_socket_t *sck, __const__ char *host, as_resolved_f cb)
+int as_resolver(as_socket_t *sck, __const__ char *host, int ipv6_first, as_resolved_f cb)
 {
     dns_hdr_flag_t dns_hdr_flag;
     uint16_t type[2] = {0x01, 0x1C};
@@ -1637,6 +1655,15 @@ int as_resolver(as_socket_t *sck, __const__ char *host, as_resolved_f cb)
         in_addr->sin_family = AF_INET;
         return cb(sck, 0, (struct sockaddr *) &addr);
     }
+    if(!sck->loop->dns_server_inited)
+    {
+        rtn = __dns_server((struct sockaddr *) &sck->loop->dns_server);
+        if(rtn != 0)
+        {
+            return cb(sck, 2, NULL);
+        }
+        sck->loop->dns_server_inited = 1;
+    }
     dns_hdr_flag.flag_rd = 1;
     dns_data_t *dns_data = malloc(sizeof(dns_data_t));
     if(dns_data == NULL)
@@ -1658,6 +1685,7 @@ int as_resolver(as_socket_t *sck, __const__ char *host, as_resolved_f cb)
     {
         as_udp_t *udp = as_udp_init(sck->loop, dns_data, NULL);
         udp->sck.type = SOCKET_TYPE_UDP_DNS;
+        udp->ipv6_first = ipv6_first;
         if(as_udp_connect(udp, (struct sockaddr *) &sck->loop->dns_server) != 0)
         {
             dns_data->dns_recved_cnt++;
