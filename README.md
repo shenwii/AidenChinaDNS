@@ -13,8 +13,6 @@ Current version: 1.0.0
     support dns on tcp
 
 ## Dependencies
-* linux(epoll)
-* pthread
 * libiniparser
 * libsqlite3
 
